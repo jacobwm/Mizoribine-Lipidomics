@@ -1,0 +1,172 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r message=FALSE, warning=FALSE}
+# Input Parameters
+  tissue <- "Plasma"
+  filepath <- "/Users/usa/Desktop/Zaganjor lab lipidomics results/lipidomics-analysis/"
+```
+
+```{r message=FALSE, warning=FALSE}
+# Load packages
+  require(tidyverse)
+  require(lipidr)
+  require(viridis)
+```
+
+```{r message=FALSE, warning=FALSE}
+# Read in data
+  tissue_data <- read.csv(paste0(filepath, tissue, ".csv"))
+
+# Remove extraneous col
+  tissue_data$lipid_id <- NULL
+
+# Remove "bad" entries (eg. 13-Docosenamide)
+  tissue_data <- subset(tissue_data, grepl(":", lipids))
+
+#remove NAs
+  tissue_data <- na.omit(tissue_data)
+
+# Convert Lipid Names to Systematic Nomenclature
+  temp <- tissue_data$lipids
+  fix = sub(";(O\\d*)", "(\\1)", temp)
+  fix = sub(" O-", "O ", fix)
+  fix = sub(" P-", "P ", fix)
+  fix = sub("-FA", "/", fix)
+  fix = sub(";(.*)$", "(\\1)", fix)
+  fix <- sub("([^\\)])\\|", "\\1(m)|", fix)
+  fix <- sub("(.*\\(m\\))\\|(.*$)", "\\1|\\2(m2)", fix)
+  fix <- sub("PE-Cer", "PECer", fix)
+  fix <- sub("PI-Cer", "PICer", fix)
+  fix <- sub("LPE-N ", "LPEN ", fix)
+  fix <- sub("LPE-N ", "LPEN ", fix)
+  
+  tissue_data$converted_lipid_name <- fix
+  
+  all_match <- lipidr::annotate_lipids(tissue_data[[ncol(tissue_data)]])
+  bad_match <- all_match %>% filter(not_matched)
+  good_match <-subset(all_match, not_matched == "FALSE")
+  
+  tissue_data %>%
+    select(lipids, converted_lipid_name) %>%
+    write_csv(paste0(filepath, "Results/", tissue, "_name_converted.csv"))
+```
+
+```{r message=FALSE, warning=FALSE}
+# Begin lipidr analysis - setup lipidr object
+  tissue_data$lipids <- tissue_data$converted_lipid_name
+  tissue_data$converted_lipid_name <- NULL
+  
+  d <- as_lipidomics_experiment(tissue_data)
+  meta <- read.csv(paste0(filepath, tissue, "_meta.csv"))
+  d <- add_sample_annotation(d, meta)
+```
+
+```{r message=FALSE, warning=FALSE}
+# QC
+  plot_samples(d, type = "tic", log = TRUE)
+  ggsave(paste0(filepath, "Plots/", tissue, "_samples.png"))
+  
+  plot_lipidclass(d, "boxplot")
+  ggsave(paste0(filepath, "Plots/", tissue, "_classes.png"))
+```
+
+```{r message=FALSE, warning=FALSE}
+# Resolve Duplicate Lipids (from multiple transitions) by selecting maximum, Normalize with PQN method, and log transform
+  d_summarized <-  summarize_transitions(d, method = "max")
+  d_normalized <-  normalize_pqn(d_summarized, measure = "Area", exclude = "blank", log = TRUE)
+  plot_samples(d_normalized, "boxplot")
+  ggsave(paste0(filepath, "Plots/", tissue, "_normalization.png"))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+# PCA
+  mvaresults <-  mva(d_normalized, measure="Area", method="PCA")
+  pca_obj <- plot_mva(mvaresults, color_by="Treatment", components = c(1,2))
+  pca_obj + theme_linedraw() + scale_color_manual(values = c("Mizoribine" = "#CCA74E", "Vehicle" = "#3C6780")) + scale_fill_manual(values = c("Mizoribine" = "#CCA74E", "Vehicle" = "#3C6780"))
+  
+  ggsave(paste0(filepath, "Plots/", tissue, "_pca.png"))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+# DE - make comparisons
+  de_results <-  de_analysis(data=d_normalized, group_col = "Treatment", Mizoribine - Vehicle, measure="Area")
+  significant_molecules(de_results, p.cutoff = 0.05, logFC.cutoff = 0)
+  
+  write_csv(de_results, paste0(filepath, "Results/", tissue, "_de.csv"))
+
+# LSEA
+  enrich_results <- lsea(de_results, rank.by = "logFC")
+  sig_lipidsets <- significant_lipidsets(enrich_results)
+  
+  write_csv(enrich_results, paste0(filepath, "Results/", tissue, "_lsea.csv"))
+```
+
+```{r}
+# Visualizations
+
+# Significant Lipid Classes (Boxplot)
+  plot_enrichment(de_results, sig_lipidsets, annotation="class")
+  ggsave(paste0(filepath, "Plots/", tissue, "_enrichment_boxplot.png"))
+
+# Volcano plot with TGs highlighted
+  de_results_volcano <- de_results %>%
+    mutate(colorcode = ifelse(P.Value < 0.05, ifelse(Class=="TG", "Significant Triglycerides", "All Other Significant Lipids"), "Not Significant"))
+  
+  p_volcano <- ggplot(de_results_volcano, aes(x = logFC, y = -log10(P.Value))) +
+    geom_point(aes(color = colorcode)) +
+    scale_color_manual(values = c("Not Significant" = "grey", "All Other Significant Lipids" = "#3C6780", "Significant Triglycerides" = "#CCA74E")) +
+    theme_linedraw() +
+      xlab("Log2(Fold Change)") +
+      ylab("-Log10(p value)") +
+      labs(color = "Legend") +
+      ggtitle(tissue) +
+      theme(legend.position = "bottom") +
+      geom_hline(yintercept = 1.3, linetype = "dashed", color = "darkgrey")
+  
+  p_volcano
+  ggsave(paste0(filepath, "Plots/", tissue, "_TG_volcano.png"))
+
+# Significant Lipid Classes (Barplot)
+  enrich_results$type <- sub("_.*", "", enrich_results$set)
+  enrich_results$class <- sub("^[^_]*_", "", enrich_results$set)
+
+  lsea_tissue_data <- enrich_results %>%
+    filter(type == "Class") %>%
+    mutate(abs_NES = abs(NES))
+
+  df_sig <- lsea_tissue_data %>% filter(padj < 0.05) %>%
+    arrange(desc(NES))
+
+  p_enrich <- ggplot(df_sig, aes(x = NES, y = reorder(class, NES), fill = padj)) +
+    geom_bar(stat = "identity", color = "black") +
+    scale_fill_continuous() +  # Adjust the scale for continuous color
+    labs(x = "Normalized Enrichment Score", y = "Lipid Class", title = tissue) +
+    theme_linedraw() +
+    scale_fill_viridis()
+
+  p_enrich
+  ggsave(paste0(filepath, "Plots/", tissue, "_enrichment_barplot_sig.png"))
+
+
+# TG Heatmat
+  de_results_tg <- de_results %>%
+    filter(Class == "TG")
+  
+  p_grid <- ggplot(de_results_tg, aes(total_cs, total_cl, fill = logFC)) + geom_tile() +
+      facet_wrap(~Class) +
+      xlab("Total chain unsaturation") + ylab("Total chain length") +
+      scale_fill_gradient2(midpoint = 0) +
+      xlim(1, 18) + ylim(26, 76) + theme_linedraw() +
+      scale_fill_gradient2(low = "blue", mid = "grey", high = "red") +
+    scale_x_continuous(breaks = seq(1, 18, by = 2)) +
+    scale_y_continuous(breaks = seq(26, 76, by = 2))
+  p_grid
+  
+  ggsave(paste0(filepath, "Plots/", tissue, "_TG_map.png"))
+```
